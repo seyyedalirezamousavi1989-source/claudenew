@@ -271,6 +271,12 @@ class TaskManager:
             thread.start()
         return task_id
 
+    def active_ids(self):
+        """Ids of tasks whose worker thread is alive right now (they hold the local model)."""
+        with self._lock:
+            return [task_id for task_id, runner in self._runners.items()
+                    if runner.get("thread") is not None and runner["thread"].is_alive()]
+
     def wait(self, task_id, timeout=None):
         runner = self._runners.get(task_id)
         if runner:
@@ -493,6 +499,8 @@ class TaskManager:
             seconds = db.execute("SELECT AVG(seconds) FROM chunks WHERE task_id=? AND status='done' AND seconds>0", (task_id,)).fetchone()[0]
             last_error = db.execute("SELECT idx, error FROM chunks WHERE task_id=? AND error != '' AND status='failed' "
                                     "ORDER BY updated_at DESC LIMIT 1", (task_id,)).fetchone()
+            current = db.execute("SELECT idx, updated_at FROM chunks WHERE task_id=? AND status='running' "
+                                 "ORDER BY idx LIMIT 1", (task_id,)).fetchone() if running else None
         remaining = total - done
         return {
             "id": task_id, "kind": task["kind"], "title": task["title"], "status": task["status"], "stage": task["stage"],
@@ -500,6 +508,11 @@ class TaskManager:
             "running": counts.get("running", 0), "percent": round(100.0 * done / total, 1) if total else 0.0,
             "elapsed_seconds": round(elapsed, 1),
             "eta_seconds": round(seconds * remaining, 1) if seconds and remaining and running else None,
+            "active": running,
+            # which chunk the model is working on right now and for how long: proves the job is alive
+            # even when a single chunk takes minutes on a local GPU
+            "current_chunk": (current["idx"] + 1) if current else None,
+            "current_chunk_seconds": round(max(0.0, time.time() - current["updated_at"]), 1) if current else None,
             "error": task["error"], "last_chunk_error": dict(last_error) if last_error else None,
             "resumable": (task["status"] in RESUMABLE and done < total) or task["status"] in (PARTIAL, INTERRUPTED),
             "created_at": task["created_at"], "updated_at": task["updated_at"],

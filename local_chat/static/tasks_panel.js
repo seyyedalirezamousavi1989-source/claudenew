@@ -155,12 +155,110 @@
       fileInput.value = "";
       say(`کار ساخته شد: ${data.task.total} بخش.`);
       refresh();
+      if (window.refreshJobBanner) window.refreshJobBanner();
     } catch (error) {
       say(error.message, true);
     } finally {
       startButton.disabled = false;
     }
   });
+
+  // ---- live banner above the composer: shows that a long job is really running -------------------------
+  const banner = document.getElementById("jobBanner");
+  const seenActive = new Map();
+  let finished = null;
+  let bannerTimer = null;
+
+  function setBusy(info) {
+    const before = window.localChatBusy || { busy: false };
+    window.localChatBusy = { busy: Boolean(info.busy), reason: info.reason || "", kind: info.kind || "" };
+    if (before.busy !== window.localChatBusy.busy) window.dispatchEvent(new Event("localchat:busy"));
+  }
+  function bannerButton(label, handler) {
+    const el = document.createElement("button");
+    el.type = "button";
+    el.textContent = label;
+    el.addEventListener("click", handler);
+    return el;
+  }
+  function openPanel() { document.getElementById("tasksButton").click(); }
+  function renderBanner(tasks) {
+    if (!banner) return;
+    const active = tasks.find((t) => ACTIVE.has(t.status));
+    banner.replaceChildren();
+    banner.className = "job-banner";
+    if (active) {
+      seenActive.set(active.id, true);
+      finished = null;
+      const verb = active.kind === "summarize" ? "خلاصه‌سازی" : "ترجمه";
+      const line = document.createElement("div");
+      line.className = "job-line";
+      const title = document.createElement("span");
+      title.className = "job-title";
+      title.textContent = `در حال ${verb}: ${active.title}`;
+      const actions = document.createElement("span");
+      actions.className = "job-actions";
+      actions.append(bannerButton("توقف موقت", () => act(active.id, "pause").then(pollBanner)), bannerButton("جزئیات", openPanel));
+      line.append(title, actions);
+      const bar = document.createElement("div");
+      bar.className = "job-bar" + (active.done === 0 ? " indeterminate" : "");
+      const fill = document.createElement("span");
+      fill.style.width = `${active.percent}%`;
+      bar.appendChild(fill);
+      const meta = document.createElement("div");
+      const parts = [`${active.done} از ${active.total} بخش تمام شد (${active.percent}٪)`];
+      if (active.current_chunk) parts.push(`بخش ${active.current_chunk} در حال پردازش است (${Math.round(active.current_chunk_seconds || 0)} ثانیه)`);
+      else parts.push(active.status === "preparing" ? "در حال آماده‌سازی و تقسیم فایل" : "در حال شروع");
+      if (active.failed) parts.push(`${active.failed} بخش ناموفق`);
+      parts.push(`زمان سپری‌شده: ${fmtTime(active.elapsed_seconds)}`);
+      parts.push(active.eta_seconds != null ? `باقی‌مانده تقریبی: ${fmtTime(active.eta_seconds)}` : "زمان باقی‌مانده بعد از اولین بخش محاسبه می‌شود");
+      meta.textContent = parts.join(" · ");
+      banner.append(line, bar, meta);
+      banner.hidden = false;
+      return;
+    }
+    for (const id of seenActive.keys()) {
+      const task = tasks.find((t) => t.id === id);
+      if (task) finished = task;
+    }
+    seenActive.clear();
+    if (finished) {
+      const task = tasks.find((t) => t.id === finished.id) || finished;
+      banner.classList.add(task.status === "completed" ? "done" : "warn");
+      const line = document.createElement("div");
+      line.className = "job-line";
+      const title = document.createElement("span");
+      title.className = "job-title";
+      title.textContent = `«${task.title}» — ${STATE_LABEL[task.status] || task.status} (${task.done} از ${task.total} بخش)`;
+      const actions = document.createElement("span");
+      actions.className = "job-actions";
+      if (task.done > 0) actions.append(bannerButton("دانلود DOCX", () => download(task.id, "docx")), bannerButton("PDF", () => download(task.id, "pdf")));
+      if (task.status !== "completed" && task.resumable) actions.append(bannerButton("ادامه", () => act(task.id, "resume").then(pollBanner)));
+      actions.append(bannerButton("کارهای طولانی", openPanel), bannerButton("×", () => { finished = null; banner.hidden = true; }));
+      line.append(title, actions);
+      banner.appendChild(line);
+      banner.hidden = false;
+      return;
+    }
+    banner.hidden = true;
+  }
+  async function pollBanner() {
+    clearTimeout(bannerTimer);
+    let delay = 8000;
+    try {
+      const data = await call("GET", "/api/tasks");
+      const tasks = data.tasks || [];
+      renderBanner(tasks);
+      setBusy(data.busy || { busy: false });
+      if (tasks.some((t) => ACTIVE.has(t.status))) delay = 2000;
+      else if (data.busy && data.busy.busy) delay = 3000;
+    } catch (error) {
+      delay = 15000;                                      // not signed in yet / server restarting: stay quiet
+    }
+    bannerTimer = setTimeout(pollBanner, delay);
+  }
+  window.refreshJobBanner = pollBanner;
+  pollBanner();
 
   document.getElementById("tasksButton").addEventListener("click", () => { overlay.hidden = false; say(""); refresh(); });
   const close = () => { overlay.hidden = true; clearTimeout(timer); };

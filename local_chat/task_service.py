@@ -118,8 +118,27 @@ class TaskService:
         chunk = docengine.plan_chunk_tokens(ctx, predict, task=params["kind"])
         return ctx, predict, chunk
 
+    # ------------------------------------------------------------------ one heavy job at a time
+    def active_tasks(self):
+        """Progress records of tasks that are running now (empty when nothing holds the local model)."""
+        manager = self._manager
+        if manager is None:
+            return []
+        return [p for p in (manager.progress(task_id) for task_id in manager.active_ids()) if p]
+
+    def ensure_idle(self, allow_task_id=None):
+        """A local GPU cannot serve two heavy jobs at once; refuse the second one with a clear reason."""
+        for task in self.active_tasks():
+            if task["id"] != allow_task_id:
+                label = "ترجمه" if task["kind"] == "translate" else "خلاصه‌سازی"
+                raise ServiceError(
+                    f"هم‌اکنون «{task['title']}» در حال {label} است ({task['done']} از {task['total']} بخش). "
+                    "برای جلوگیری از فشار روی سخت‌افزار، تا پایان یا توقف آن کار جدیدی شروع نمی‌شود.", 409)
+
     # ------------------------------------------------------------------ create / control
     def create(self, name, data, options):
+        self.manager                                       # make sure recovery ran before counting active jobs
+        self.ensure_idle()
         kind = _clean(options.get("kind"), 20) or "translate"
         model = _clean(options.get("model"), 200)
         if kind not in KINDS:
@@ -156,6 +175,7 @@ class TaskService:
         task = self.manager.get(task_id)
         if task is None:
             raise ServiceError("کار پیدا نشد.", 404)
+        self.ensure_idle(allow_task_id=task_id)
         try:
             self.manager.start(task_id, self.processor(task), workers=task["params"].get("workers", 1))
         except tasks.TaskError as exc:

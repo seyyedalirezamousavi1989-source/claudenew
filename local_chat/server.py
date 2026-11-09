@@ -52,6 +52,7 @@ if __package__:
     from . import forex_service, mt5_data, forex_desk, forex_intent, forex_chart
     from . import context_manager
     from . import project_workspace
+    from . import project_digest
     from . import conversation_store as conversation_store_module
     from . import task_service as task_service_module
 else:
@@ -74,6 +75,7 @@ else:
     import forex_service, mt5_data, forex_desk, forex_intent, forex_chart
     import context_manager
     import project_workspace
+    import project_digest
     import conversation_store as conversation_store_module
     import task_service as task_service_module
 
@@ -88,7 +90,7 @@ MODEL_PATTERN = re.compile(r"^(?!.*\.\.)(?!.*//)[A-Za-z0-9][A-Za-z0-9._:/@-]{0,1
 MAX_SEARCH_QUERY_LENGTH = 500
 MAX_SEARCH_RESULTS = 12
 MAX_PAGE_BYTES = 1_000_000
-MAX_PAGE_TEXT = 3000
+MAX_PAGE_TEXT = 40000   # raw text kept per page; search_engine.focus_text keeps only the passages that answer the query
 APP_VERSION = version_info.APP_VERSION
 SERVER_STARTED_AT = time.time()
 NUM_CTX = 8192
@@ -104,7 +106,7 @@ TRANSCRIBE_PROMPT = (
     "Output only the transcript. If there is no speech, briefly describe the sounds you hear."
 )
 PROMPT_CHAR_BUDGET = 12000
-MAX_WEB_CONTEXT_CHARS = 6500
+MAX_WEB_CONTEXT_CHARS = 8000
 SESSIONS = {}  # browser session id -> csrf token (in memory only; lost on restart on purpose)
 SESSIONS_LOCK = threading.Lock()
 MAX_SESSIONS = 200
@@ -581,6 +583,49 @@ def _ollama_model_available(model):
                    for item in (payload.get("models") or []) if isinstance(item, dict))
     except (OSError, ValueError, TypeError, URLError, TimeoutError):
         return False
+
+
+CHAT_SLOT = threading.Lock()          # held for the whole duration of one streamed chat reply
+CHAT_SLOT_SINCE = {"t": 0.0}
+
+
+def _busy_task_reason():
+    """Persian reason when a long translate/summarise task is holding the model, else ''."""
+    service = TASK_SERVICE
+    if service is None:
+        return ""
+    try:
+        active = service.active_tasks()
+    except Exception:
+        return ""
+    if not active:
+        return ""
+    task = active[0]
+    label = "ترجمه" if task["kind"] == "translate" else "خلاصه‌سازی"
+    return (f"هم‌اکنون «{task['title']}» در حال {label} است ({task['done']} از {task['total']} بخش، "
+            f"{int(task['percent'])}٪). تا پایان یا توقف موقت آن، پیام جدید به مدل ارسال نمی‌شود؛ "
+            "پیشرفت را در نوار بالای ورودی ببین.")
+
+
+def _acquire_model_slot():
+    """Returns the acquired lock, or a Persian reason string when the model is already busy."""
+    reason = _busy_task_reason()
+    if reason:
+        return reason
+    if not CHAT_SLOT.acquire(blocking=False):
+        return "مدل هنوز مشغول پاسخ قبلی است. صبر کن تمام شود یا دکمهٔ توقف را بزن، بعد پیام بعدی را بفرست."
+    CHAT_SLOT_SINCE["t"] = time.time()
+    return CHAT_SLOT
+
+
+def _busy_status():
+    reason = _busy_task_reason()
+    if reason:
+        tasks_now = TASK_SERVICE.active_tasks() if TASK_SERVICE is not None else []
+        return {"busy": True, "kind": "task", "reason": reason, "tasks": tasks_now}
+    if CHAT_SLOT.locked():
+        return {"busy": True, "kind": "chat", "reason": "مدل در حال تولید پاسخ است.", "tasks": []}
+    return {"busy": False, "kind": "", "reason": "", "tasks": []}
 
 
 _TRANSLATE_TASK_RE = re.compile(r"(?:ترجمه|ترجمه[\s\u200c]*کن|ترجمه[\s\u200c]*اش|translate|translate\s+it|translate\s+this)", re.I)
@@ -1064,7 +1109,7 @@ def _capability_question_answer(text):
 
 
 class PageTextParser(HTMLParser):
-    skip_tags = {"script", "style", "noscript", "svg", "nav", "footer", "header", "form"}
+    skip_tags = {"script", "style", "noscript", "svg", "nav", "footer", "header", "form", "aside", "iframe", "button"}
     block_tags = {"article", "br", "div", "h1", "h2", "h3", "li", "p", "section"}
 
     def __init__(self):
@@ -1194,7 +1239,10 @@ def _fetch_public_page(url):
                 "GET",
                 target,
                 headers={
-                    "User-Agent": "LocalChat/1.0 (web search)",
+                    # many sites answer 403 to unknown bots; a normal browser identity gets the real page
+                    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                   "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
+                    "Accept-Language": "fa,en;q=0.8",
                     "Accept": "text/html,text/plain;q=0.9",
                     "Accept-Encoding": "identity",
                     "Connection": "close",
@@ -1302,22 +1350,23 @@ def _ddg_results(query):
     return results
 
 
-def _attach_page_content(results):
-    """Fetch readable text for the first three results (in parallel, SSRF-safe)."""
+def _attach_page_content(results, query=""):
+    """Fetch readable text for the first results (in parallel, SSRF-safe) and keep the passages that match the query."""
     if not results:
         return results
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+    pages = search_engine.FETCH_PAGES
+    with concurrent.futures.ThreadPoolExecutor(max_workers=pages) as executor:
         futures = {
             executor.submit(_fetch_public_page, result["url"]): result
-            for result in results[:3]
+            for result in results[:pages]
         }
         for future, result in futures.items():
-            result["content"] = future.result()
+            result["content"] = search_engine.focus_text(future.result(), query)
     return results
 
 
 def _search_duckduckgo(query):
-    return _attach_page_content(_ddg_results(query))
+    return _attach_page_content(_ddg_results(query), query)
 
 
 SEARCH_PROVIDER_LABELS = {
@@ -3436,7 +3485,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         query = parse_qs(urlsplit(self.path).query)
         try:
             if not parts:
-                self._send_json(200, {"tasks": service.manager.list()})
+                self._send_json(200, {"tasks": service.manager.list(), "busy": _busy_status()})
             elif len(parts) == 1:
                 self._send_json(200, {"task": service.detail(parts[0])})
             elif len(parts) == 2 and parts[1] == "download":
@@ -3457,6 +3506,20 @@ class ChatHandler(BaseHTTPRequestHandler):
     def _tasks_post(self, path):
         service = _task_service()
         parts = [p for p in path.split("/") if p][2:]
+        starts_work = (not parts) or (len(parts) == 2 and parts[1] in ("start", "resume", "retry", "regenerate"))
+        if starts_work and CHAT_SLOT.locked():
+            # drain the body first so the client gets this answer instead of a connection reset
+            try:
+                remaining = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                remaining = 0
+            while 0 < remaining:
+                piece = self.rfile.read(min(remaining, 1 << 20))
+                if not piece:
+                    break
+                remaining -= len(piece)
+            self._send_json(409, {"code": "busy", "error": "مدل هم‌اکنون در حال تولید پاسخ چت است. بعد از پایان پاسخ، کار را شروع کن."})
+            return
         try:
             if not parts:                                  # new task: raw file body + options in X-Task-Options (JSON)
                 try:
@@ -3613,7 +3676,16 @@ class ChatHandler(BaseHTTPRequestHandler):
         if not (last["role"] == "user" and last.get("attachments")):
             if self._local_shortcut(payload):
                 return
-        self._chat_with_model(payload)
+        # The local model/GPU serves ONE heavy job at a time: a second chat request while a reply
+        # or a long translation is running would only slow both down (or run out of VRAM).
+        slot = _acquire_model_slot()
+        if isinstance(slot, str):
+            self._send_json(409, {"code": "busy", "error": slot})
+            return
+        try:
+            self._chat_with_model(payload)
+        finally:
+            slot.release()
 
     def _local_shortcut(self, payload):
         """Answer memory commands and questions about the assistant without the model."""
@@ -3673,15 +3745,18 @@ class ChatHandler(BaseHTTPRequestHandler):
                     if record:
                         # Project manifests are persisted independently of chat history.
                         # Add only a compact structural summary; never re-inject the ZIP.
-                        if record.get("project_manifest") and record.get("workspace_id"):
-                            try:
-                                project_block = WORKSPACES.project_context(
-                                    record.get("workspace_id"), str(message.get("content") or ""), max_chars=2200)
-                                if project_block:
-                                    record = dict(record)
-                                    record["text"] = (str(record.get("text") or "")[:1800] + "\n\n" + project_block)
-                            except Exception:
-                                pass
+                        if record.get("kind") == "archive":
+                            # The model gets a query-aware digest of the WHOLE project (file tree + code map of every
+                            # file + the relevant code), fitted to its context in render_for_prompt. The old code
+                            # replaced the archive by its first 1800 characters, so nothing could be analysed.
+                            record = dict(record)
+                            record["digest_query"] = str(message.get("content") or "")
+                            if record.get("project_manifest") and record.get("workspace_id"):
+                                try:
+                                    record["project_block"] = WORKSPACES.project_context(
+                                        record.get("workspace_id"), str(message.get("content") or ""), max_chars=2200)
+                                except Exception:
+                                    pass
                         records.append(record)
                     else:
                         missing += 1
@@ -3709,6 +3784,16 @@ class ChatHandler(BaseHTTPRequestHandler):
                                     WORKSPACES.register(record)
                                 except Exception:
                                     pass
+                                if record.get("kind") == "archive" and record.get("text"):
+                                    # follow-up about an earlier project: a fresh digest for THIS question
+                                    # (the lexical index found nothing for Persian questions about English code)
+                                    records.append({"name": f"{record.get('name', 'project.zip')} (نمای فشردهٔ مرتبط با پرسش فعلی)",
+                                                    "kind": "text", "size": record.get("size", 0), "truncated": False,
+                                                    "notes": [], "text": project_digest.build_digest(
+                                                        record["text"], query_text, 9000,
+                                                        extra=(WORKSPACES.project_context(record.get("workspace_id"), query_text, max_chars=1800)
+                                                               if record.get("project_manifest") and record.get("workspace_id") else ""))})
+                                    continue
                                 prior_ids.append(attachment_id)
                                 if record.get("project_manifest") and record.get("workspace_id"):
                                     try:
@@ -3762,9 +3847,11 @@ class ChatHandler(BaseHTTPRequestHandler):
                         "task_created": {"id": task.get("id"), "title": task.get("title"),
                                          "total": task.get("total", 0), "status": task.get("status")},
                         "message": {"role": "assistant", "content":
-                            f"کار {action_label} فایل «{source_record.get('name')}» به‌صورت پایدار ساخته شد. "
-                            f"تعداد بخش‌ها: {task.get('total', 0)}. پردازش در پس‌زمینه ادامه می‌یابد؛ "
-                            "پنجرهٔ «کارهای طولانی» برای مشاهدهٔ پیشرفت و دریافت فایل خروجی باز شد."},
+                            f"کار {action_label} فایل «{source_record.get('name')}» شروع شد. "
+                            f"تعداد بخش‌ها: {task.get('total', 0)}. پیشرفت زنده (بخش جاری، درصد و زمان باقی‌مانده) "
+                            "در نوار بالای کادر ورودی نمایش داده می‌شود. تا پایان کار، پیام جدیدی به مدل ارسال نمی‌شود "
+                            "تا سخت‌افزار زیر بار دو درخواست نرود؛ هر وقت خواستی از همان نوار می‌توانی کار را متوقف کنی. "
+                            "بعد از پایان، فایل خروجی (DOCX/PDF/MD/TXT) از «کارهای طولانی» قابل دریافت است."},
                         "done": True, "done_reason": "stop",
                     })
                     return

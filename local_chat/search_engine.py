@@ -354,6 +354,66 @@ def _run_query(calls, language=None):
     return results, errors, successful
 
 
+_STOP_WORDS = frozenset((
+    "چی", "چیه", "چیست", "است", "هست", "برای", "درباره", "دربارهٔ", "راجع", "را", "که", "این", "آن", "اون", "با", "از", "در", "به",
+    "هم", "یا", "کن", "کنید", "بگرد", "بگو", "سرچ", "جستجو", "جست", "وب", "اینترنت", "لطفا", "لطفاً", "ببین", "پیدا", "تحقیق",
+    "the", "and", "for", "what", "how", "who", "when", "where", "about", "with", "search", "find", "online", "please", "tell",
+))
+FOCUS_LIMIT = 1800
+FETCH_PAGES = 5
+
+
+def _query_terms(query):
+    words = re.findall(r"[\w\u0600-\u06ff]+", _normal(query).casefold())
+    return {w for w in words if len(w) > 2 and w not in _STOP_WORDS}
+
+
+def focus_text(text, query, limit=FOCUS_LIMIT):
+    """Pick the passages of a page that answer the query instead of its first N characters.
+
+    Page text starts with menus and boilerplate; the useful sentences are usually further down. Windows of
+    neighbouring sentences are scored by how many distinct query words they contain, the best ones are kept
+    (in page order) until ``limit`` characters are used. With no usable query the head of the page is returned.
+    """
+    text = " ".join(str(text or "").split())
+    if len(text) <= limit:
+        return text
+    terms = _query_terms(query)
+    if not terms:
+        return text[:limit]
+    sentences = [x for x in re.split(r"(?<=[.!?؟۔])\s+", text) if x.strip()]
+    windows, current = [], ""
+    for sentence in sentences:
+        if current and len(current) + len(sentence) > 260:
+            windows.append(current)
+            current = ""
+        current = (current + " " + sentence).strip() if current else sentence
+        while len(current) > 420:                          # a page without punctuation: cut it
+            windows.append(current[:260])
+            current = current[260:]
+    if current:
+        windows.append(current)
+    scored = []
+    for position, window in enumerate(windows):
+        lowered = window.casefold()
+        hits = sum(1 for term in terms if term in lowered)
+        if hits:
+            scored.append((hits / len(terms), -position, position, window))
+    if not scored:
+        return text[:limit]
+    scored.sort(reverse=True)
+    chosen, used = [], 0
+    for _score, _neg, position, window in scored:
+        if used + len(window) > limit and chosen:
+            continue
+        chosen.append((position, window[:limit - used] if not chosen else window))
+        used += len(window) + 3
+        if used >= limit:
+            break
+    chosen.sort()
+    return " … ".join(window for _position, window in chosen)[:limit + 40]
+
+
 def search(query, config, ddg_search, page_fetch=None, max_results=MAX_RESULTS, search_options=None):
     """Search using natural-language constraints; URLs always originate from providers."""
     original_query = _normal(query)[:1000]
@@ -439,11 +499,11 @@ def search(query, config, ddg_search, page_fetch=None, max_results=MAX_RESULTS, 
 
     fetchable_pages = [item for item in results if item.get("link_type") != "file"]
     if callable(page_fetch) and fetchable_pages:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-            future_map = {pool.submit(page_fetch, item["url"]): item for item in fetchable_pages[:3]}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=FETCH_PAGES) as pool:
+            future_map = {pool.submit(page_fetch, item["url"]): item for item in fetchable_pages[:FETCH_PAGES]}
             for future, item in future_map.items():
                 try:
-                    item["content"] = future.result() or ""
+                    item["content"] = focus_text(future.result() or "", query)
                     item["verified"] = bool(item["content"])
                 except Exception:
                     item["content"] = ""

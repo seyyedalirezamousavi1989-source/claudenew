@@ -156,13 +156,24 @@ function setConnection(online, message) {
 function updateChatAccess() {
   const ready = identityReady && identityVerified && modelsReady;
   const busy = Boolean(generationController);
+  // a long translation / summary is holding the local model: no second request until it ends or is paused
+  const jobBusy = Boolean(window.localChatBusy && window.localChatBusy.busy && window.localChatBusy.kind === "task");
   const hasAttachments = typeof pendingAttachmentCount === "function" && pendingAttachmentCount() > 0;
   const uploading = typeof attachmentsUploading === "function" && attachmentsUploading();
-  messageInput.disabled = !ready || busy;
+  messageInput.disabled = !ready || busy || jobBusy;
+  if (jobBusy) {
+    if (messageInput.dataset.basePlaceholder === undefined) messageInput.dataset.basePlaceholder = messageInput.placeholder;
+    messageInput.placeholder = "یک کار طولانی روی مدل در حال اجراست؛ بعد از پایان یا توقف آن پیام بفرست…";
+  } else if (messageInput.dataset.basePlaceholder !== undefined) {
+    messageInput.placeholder = messageInput.dataset.basePlaceholder;
+    delete messageInput.dataset.basePlaceholder;
+  }
   const attach = document.getElementById("attachButton");
-  if (attach) attach.disabled = !ready || busy;
-  sendButton.disabled = !ready || (!busy && (uploading || (!messageInput.value.trim() && !hasAttachments)));
+  if (attach) attach.disabled = !ready || busy || jobBusy;
+  sendButton.disabled = !ready || jobBusy || (!busy && (uploading || (!messageInput.value.trim() && !hasAttachments)));
+  composer.classList.toggle("is-locked", jobBusy);
 }
+window.addEventListener("localchat:busy", () => updateChatAccess());
 
 function capsOf(name) {
   const caps = modelCaps[name];
@@ -814,7 +825,7 @@ async function streamReply(chat, body, compact = false) {
     const searchIndex = chatMessages.indexOf(latestSearch);
     const allSources = Array.isArray(latestSearch.sources) ? latestSearch.sources : [];
     const sources = allSources.slice(0, compact ? 3 : 5);
-    const perSource = compact ? 700 : 1400;
+    const perSource = compact ? 700 : 1500;
     const isMedia = sources.some((source) => MEDIA_KIND[source.kind]);
     const context = sources.length
       ? sources.map((source, index) => {
@@ -869,8 +880,9 @@ async function streamReply(chat, body, compact = false) {
   const handleChunk = (chunk) => {
     if (chunk.error) throw new Error(chunk.error);
     if (chunk.task_created) {
-      const taskButton = document.getElementById("tasksButton");
-      if (taskButton) taskButton.click();
+      // live progress lives in the banner above the composer (the overlay used to hide the chat)
+      if (window.refreshJobBanner) window.refreshJobBanner();
+      setTimeout(() => window.refreshJobBanner && window.refreshJobBanner(), 1200);
     }
     if (chunk.plan_approval) { showPlanCard(chunk.plan_approval); return; }
     if (chunk.approval_required) { showApprovalCard(chunk.approval_required); return; }
@@ -1006,6 +1018,10 @@ async function sendMessage(text, options = {}) {
   let content = text.trim();
   if (!content && attachments.length) content = "پیوست‌ها را بخوان و تحلیل کن.";
   if (!content || generationController || modelSelect.disabled) return;
+  if (window.localChatBusy && window.localChatBusy.busy && window.localChatBusy.kind === "task") {
+    showToast(window.localChatBusy.reason || "یک کار طولانی روی مدل در حال اجراست.");
+    return;
+  }
   if (!activeConversationId) {
     activeConversationId = crypto.randomUUID();
     conversations.unshift({
@@ -1097,7 +1113,16 @@ async function sendMessage(text, options = {}) {
       addContinueButton(assistantBody.closest(".message"));
     }
   } catch (error) {
-    if (error.name !== "AbortError") {
+    if (error.code === "busy") {
+      // the server refused a second heavy request: take the unsent turn back instead of leaving an error bubble
+      const at = chat.messages.indexOf(userMessage);
+      if (at >= 0) chat.messages.splice(at, 2);
+      userArticle?.remove();
+      assistantBody.closest(".message")?.remove();
+      if (!messageInput.value.trim()) messageInput.value = content;
+      showToast(error.message);
+      if (window.refreshJobBanner) window.refreshJobBanner();
+    } else if (error.name !== "AbortError") {
       const lastMessage = chat.messages[chat.messages.length - 1];
       lastMessage.content = lastMessage.content
         ? `${lastMessage.content}\n\nخطا: ${error.message}`

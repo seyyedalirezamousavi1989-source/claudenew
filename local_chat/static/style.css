@@ -392,3 +392,18 @@ select.settings-input { background: #fff; }
 .task-error { font-size: 11px; color: #b3261e; margin-top: 4px; }
 .task-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .task-actions .settings-button { padding: 5px 10px; }
+
+/* live banner for long jobs (PDF translation / summarising) above the composer */
+.job-banner { margin: 0 0 8px; padding: 10px 14px; border: 1px solid #cfe8df; border-radius: 14px; background: #f1faf6; font-size: 12.5px; line-height: 1.7; color: #1d3b32; }
+.job-banner.done { border-color: #dedede; background: #f6f6f6; color: #333; }
+.job-banner.warn { border-color: #f0d9a8; background: #fff8e8; color: #5a4310; }
+.job-banner .job-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.job-banner .job-title { font-weight: 600; }
+.job-banner .job-bar { height: 6px; margin: 7px 0 4px; border-radius: 4px; background: #d8ece4; overflow: hidden; }
+.job-banner .job-bar > span { display: block; height: 100%; background: #10a37f; transition: width .6s ease; }
+.job-banner .job-bar.indeterminate > span { width: 35% !important; animation: jobslide 1.3s ease-in-out infinite alternate; }
+@keyframes jobslide { from { margin-inline-start: 0; } to { margin-inline-start: 65%; } }
+.job-banner .job-actions { display: flex; gap: 6px; margin-inline-start: auto; }
+.job-banner button { padding: 3px 11px; border: 1px solid #b9d8cc; border-radius: 9px; background: #fff; color: inherit; font: inherit; cursor: pointer; }
+.job-banner button:hover { background: #eef7f3; }
+.composer.is-locked textarea { cursor: not-allowed; }

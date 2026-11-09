@@ -20,7 +20,7 @@ from pathlib import Path, PurePosixPath
 
 MAX_UPLOAD_BYTES = 128 * 1024 * 1024
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
-MAX_STORED_TEXT_CHARS = 400_000
+MAX_STORED_TEXT_CHARS = 1_200_000   # archives keep far more than a prompt can hold; project_digest fits it per question
 MAX_AUDIO_SECONDS = 600
 AUDIO_CHUNK_SECONDS = 28  # Gemma audio models accept at most 30 s per clip
 AUDIO_RATE = 16000
@@ -32,8 +32,8 @@ ZIP_MAX_ENTRIES_LISTED = 400
 ZIP_MAX_ENTRIES_SCANNED = 5000
 ZIP_MAX_DECLARED_TOTAL = 500 * 1024 * 1024
 ZIP_MAX_FILE_BYTES = 1_000_000
-ZIP_MAX_FILES_READ = 80
-ZIP_MAX_TEXT_CHARS = 250_000
+ZIP_MAX_FILES_READ = 300
+ZIP_MAX_TEXT_CHARS = 1_000_000
 ZIP_PER_FILE_CHARS = 40_000
 SKIP_DIRS = {
     "__pycache__", ".git", ".svn", ".hg", "node_modules", ".venv", "venv", "env",
@@ -336,6 +336,24 @@ def extract_ipynb(text):
 
 # --- zip ---------------------------------------------------------------------------
 
+_CODE_EXTS = {".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".vue", ".java", ".kt", ".kts", ".dart", ".go", ".rs", ".c", ".cc",
+              ".cpp", ".h", ".hpp", ".cs", ".php", ".rb", ".swift", ".html", ".css", ".sh", ".bat", ".ps1", ".sql"}
+_KEY_FILE = re.compile(r"(^|/)(readme[^/]*|main\.[a-z]+|app\.[a-z]+|server\.[a-z]+|index\.[a-z]+|manage\.py|package\.json|pyproject\.toml|"
+                       r"requirements[^/]*\.txt|pubspec\.yaml|build\.gradle(\.kts)?|dockerfile)$", re.I)
+
+
+def _read_priority(path):
+    """Which files are read first when an archive is bigger than the limits: key files, then source code
+    (non-test before test), then everything else (notes, data). Plain depth ordering used to fill the quota
+    with root-level notes and never reach the code in sub-folders."""
+    lowered = path.lower()
+    if _KEY_FILE.search(lowered):
+        return 0
+    if _ext(lowered) in _CODE_EXTS:
+        return 2 if re.search(r"(^|/)(tests?|__tests__)(/|$)|(^|/)test_[^/]*$|[._-](test|spec)\.", lowered) else 1
+    return 3
+
+
 def extract_zip(data, name):
     try:
         archive = zipfile.ZipFile(io.BytesIO(data))
@@ -367,7 +385,7 @@ def extract_zip(data, name):
             continue
         if looks_like_text_name(path) or _ext(path) in {".ipynb"}:
             readable.append((path, info))
-    readable.sort(key=lambda item: (len(PurePosixPath(item[0]).parts), item[0].lower()))
+    readable.sort(key=lambda item: (_read_priority(item[0]), len(PurePosixPath(item[0]).parts), item[0].lower()))
 
     lines = [f"آرشیو ZIP «{name}»: {len(files)} فایل، حجم بازشده {human_size(declared_total)}", "", "ساختار:"]
     for path, size in listing[:ZIP_MAX_ENTRIES_LISTED]:
@@ -703,6 +721,13 @@ def render_for_prompt(record, limit):
     if not text.strip():
         note = " ".join(record.get("notes", [])) or "محتوای متنی ندارد."
         return f"[پیوست {header} — {note}]", False
+    if kind == "archive" and record.get("digest_query") is not None and len(text) > limit:
+        try:
+            from .project_digest import build_digest
+        except ImportError:                                             # pragma: no cover
+            from project_digest import build_digest
+        digest = build_digest(text, record.get("digest_query") or "", max(limit, 1500), extra=record.get("project_block") or "")
+        return f"[پیوست {header}]\n{digest}", True
     clipped_text, clipped = _clip(text, max(limit, 200))
     marker = ""
     if clipped or record.get("truncated"):
