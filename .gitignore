@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+*.log
+build/
+dist/
+*.egg-info/
+# local runtime data / secrets
+local_chat/smtp_settings.json
+local_chat/data/
+*.sqlite
+*.db
